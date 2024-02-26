@@ -7,49 +7,14 @@ const TAG_TASKID = 1345
 const TAG_DONE = 1346
 
 function send(data, comm; dest, tag)
-    req = MPI.Isend(data, comm; dest, tag)
-    while !MPI.Test(req)
-        yield()
-    end
+    MPI.Send(data, comm; dest, tag)
     return nothing
 end
 
 function recv(::Type{T}, comm; source, tag) where {T}
-    data = Ref{T}()
-    req = MPI.Irecv!(data, comm; source = source, tag = tag)
-    status = MPI.Status(0, 0, 0, 0, 0)
+    data, status = MPI.Recv(T, comm, MPI.Status; source, tag)
 
-    while ((flag, status) = MPI.Test(req, MPI.Status); !flag)
-        yield()
-    end
-    return data[], status
-end
-
-struct TaskInterruptedException <: Exception end
-
-# Base.@sync only propagates errors once all tasks are done. We want
-# to fail everything as soon as one task is broken. Possibly this is
-# not completely bullet-proof, but good enough for now.
-function sync_or_error(tasks::AbstractArray{Task})
-    c = Channel(Inf)
-    for t in tasks
-        @async begin
-            Base._wait(t)
-            put!(c, t)
-        end
-    end
-    for _ in eachindex(tasks)
-        t = take!(c)
-        if istaskfailed(t)
-            for tother in tasks
-                if tother != t
-                    schedule(tother, TaskInterruptedException(); error = true)
-                end
-            end
-            throw(TaskFailedException(t))
-        end
-    end
-    close(c)
+    return data, status
 end
 
 function run(
@@ -60,9 +25,6 @@ function run(
     MPI.Init()
 
     if MPI.Comm_rank(comm) == 0
-        # t_work = @async res = worker($funcs, $comm)
-        # t_ctrl = @async controller($funcs, $comm)
-        # sync_or_error([t_work, t_ctrl])
         controller(funcs, comm; log_frequency)
         res = Dict()
         return getindex.(Ref(reduce(merge, MPI.gather(res, comm))), eachindex(funcs))
