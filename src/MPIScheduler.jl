@@ -1,6 +1,7 @@
 module MPIScheduler
 using MPI
-using ProgressMeter
+using Printf
+using Dates
 
 const TAG_TASKID = 1345
 const TAG_DONE = 1346
@@ -51,55 +52,67 @@ function sync_or_error(tasks::AbstractArray{Task})
     close(c)
 end
 
-function run(funcs::AbstractVector; comm = MPI.COMM_WORLD)
+function run(
+    funcs::AbstractVector;
+    comm = MPI.COMM_WORLD,
+    log_frequency = max(1, length(funcs) ÷ 1000),
+)
     MPI.Init()
 
-    res = nothing
     if MPI.Comm_rank(comm) == 0
-        t_work = @async res = worker($funcs, $comm)
-        t_ctrl = @async controller($funcs, $comm)
-        sync_or_error([t_work, t_ctrl])
-
-        return getindex.(Ref(reduce(merge,MPI.gather(res, comm))), eachindex(funcs))
+        # t_work = @async res = worker($funcs, $comm)
+        # t_ctrl = @async controller($funcs, $comm)
+        # sync_or_error([t_work, t_ctrl])
+        controller(funcs, comm; log_frequency)
+        res = Dict()
+        return getindex.(Ref(reduce(merge, MPI.gather(res, comm))), eachindex(funcs))
     else
-        res = worker(funcs, comm) 
+        res = worker(funcs, comm)
         MPI.gather(res, comm)
         return nothing
     end
 end
 
-function controller(funcs, comm)
+function controller(funcs, comm; log_frequency)
     inprogress = 0
     done = 0
-    for i = 1:min(length(funcs), MPI.Comm_size(comm))
-        send(i, comm; dest=i-1, tag=TAG_TASKID)
+    for i = 1:MPI.Comm_size(comm)-1
+        send(i, comm; dest = i, tag = TAG_TASKID)
         inprogress += 1
     end
 
-    p = Progress(length(funcs))
-
     while done < length(funcs)
-        _, status = recv(Int, comm; source = MPI.ANY_SOURCE, tag=TAG_DONE)
+        _, status = recv(Int, comm; source = MPI.ANY_SOURCE, tag = TAG_DONE)
 
         done += 1
-        next!(p)
-        send(inprogress+1, comm; dest = status.source, tag = TAG_TASKID)
+
+        if done % log_frequency == 0 || done == length(funcs)
+            println(
+                "$(round(now(), Dates.Second)): $(@sprintf("%5d/%d", done, length(funcs)))",
+            )
+        end
+        send(inprogress + 1, comm; dest = status.source, tag = TAG_TASKID)
         inprogress += 1
     end
 
     return nothing
-end      
+end
 
 function worker(funcs, comm)
-    results = Dict{Int, Any}()
+    results = Dict{Int,Any}()
     while true
-        taskid,_ = recv(Int, comm; source = 0, tag=TAG_TASKID)
+        waittime = @elapsed begin
+            taskid, _ = recv(Int, comm; source = 0, tag = TAG_TASKID)
+        end
+        if waittime > 1
+            @warn "waited a long time for a new task: $waittime s"
+        end
         if taskid < 1 || taskid > length(funcs)
             break
-        end        
+        end
 
         results[taskid] = funcs[taskid]()
-        send(taskid, comm; dest = 0, tag=TAG_DONE)
+        send(taskid, comm; dest = 0, tag = TAG_DONE)
     end
 
     return results
