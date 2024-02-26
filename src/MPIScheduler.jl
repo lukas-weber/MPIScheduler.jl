@@ -23,6 +23,9 @@ function run(
     log_frequency = max(1, length(funcs) ÷ 1000),
 )
     MPI.Init()
+    if MPI.Comm_size(comm) == 1
+        return [f() for f in funcs]
+    end
 
     if MPI.Comm_rank(comm) == 0
         controller(funcs, comm; log_frequency)
