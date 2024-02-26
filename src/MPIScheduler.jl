@@ -6,6 +6,8 @@ using Dates
 const TAG_TASKID = 1345
 const TAG_DONE = 1346
 
+struct Silent end
+
 function send(data, comm; dest, tag)
     MPI.Send(data, comm; dest, tag)
     return nothing
@@ -20,7 +22,7 @@ end
 function run(
     funcs::AbstractVector;
     comm = MPI.COMM_WORLD,
-    log_frequency = max(1, length(funcs) ÷ 1000),
+    log_frequency::Union{Silent, Integer} = max(1, length(funcs) ÷ 1000),
 )
     MPI.Init()
     if MPI.Comm_size(comm) == 1
@@ -51,7 +53,7 @@ function controller(funcs, comm; log_frequency)
 
         done += 1
 
-        if done % log_frequency == 0 || done == length(funcs)
+        if log_frequency !== Silent() && (done % log_frequency == 0 || done == length(funcs))
             println(
                 "$(round(now(), Dates.Second)): $(@sprintf("%5d/%d", done, length(funcs)))",
             )
