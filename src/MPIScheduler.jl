@@ -2,74 +2,91 @@ module MPIScheduler
 using MPI
 using Printf
 using Dates
+using JLD2
+
+include("result_accumulator.jl")
 
 const TAG_TASKID = 1345
 const TAG_DONE = 1346
 
 struct Silent end
-
-function send(data, comm; dest, tag)
-    MPI.Send(data, comm; dest, tag)
-    return nothing
-end
-
-function recv(::Type{T}, comm; source, tag) where {T}
-    data, status = MPI.Recv(T, comm, MPI.Status; source, tag)
-
-    return data, status
-end
+struct Idle end
 
 function run(
     funcs::AbstractVector;
+    output_file::Union{Nothing,AbstractString} = nothing,
     comm = MPI.COMM_WORLD,
-    log_frequency::Union{Silent, Integer} = max(1, length(funcs) ÷ 1000),
+    log_frequency::Union{Silent,Integer} = max(1, length(funcs) ÷ 1000),
 )
+    accumulator =
+        isnothing(output_file) ? MemoryAccumulator(length(funcs)) :
+        JLD2Accumulator(length(funcs), output_file)
     MPI.Init()
     if MPI.Comm_size(comm) == 1
-        return [f() for f in funcs]
+        for (i, f) in enumerate(funcs)
+            if !hasresult(accumulator, i)
+                accumulator[i] = f()
+            end
+            log_progress(i, length(funcs), log_frequency)
+        end
+        return accumulator
     end
 
+    MPI.Barrier(MPI.COMM_WORLD)
     if MPI.Comm_rank(comm) == 0
-        controller(funcs, comm; log_frequency)
-        res = Dict()
-        return getindex.(Ref(reduce(merge, MPI.gather(res, comm))), eachindex(funcs))
+        return controller(funcs, comm, accumulator; log_frequency)
     else
-        res = worker(funcs, comm)
-        MPI.gather(res, comm)
-        return nothing
+        return worker(funcs, comm)
     end
 end
 
-function controller(funcs, comm; log_frequency)
-    inprogress = 0
-    done = 0
-    for i = 1:MPI.Comm_size(comm)-1
-        send(i, comm; dest = i, tag = TAG_TASKID)
+function find_next_task(accumulator, inprogress, done)
+    inprogress += 1
+    while inprogress <= length(accumulator) && hasresult(accumulator, inprogress)
         inprogress += 1
+        done += 1
     end
 
-    while done < length(funcs)
-        _, status = recv(Int, comm; source = MPI.ANY_SOURCE, tag = TAG_DONE)
+    return inprogress, done
+end
 
-        done += 1
-
-        if log_frequency !== Silent() && (done % log_frequency == 0 || done == length(funcs))
-            println(
-                "$(round(now(), Dates.Second)): $(@sprintf("%5d/%d", done, length(funcs)))",
-            )
-        end
-        send(inprogress + 1, comm; dest = status.source, tag = TAG_TASKID)
-        inprogress += 1
+function log_progress(done, num_tasks, log_frequency)
+    if log_frequency !== Silent() && (done % log_frequency == 0 || done == num_tasks)
+        println("$(round(now(), Dates.Second)): $(@sprintf("%5d/%d", done, num_tasks))")
     end
 
     return nothing
 end
 
+function controller(funcs, comm, accumulator; log_frequency)
+    inprogress = 0
+    done = 0
+
+    while done < length(funcs)
+        (taskid, result), status =
+            MPI.recv(comm, MPI.Status; source = MPI.ANY_SOURCE, tag = TAG_DONE)
+
+        if result !== Idle()
+            accumulator[taskid] = result
+            done += 1
+            log_progress(done, length(funcs), log_frequency)
+        end
+
+        inprogress, done = find_next_task(accumulator, inprogress, done)
+
+        MPI.send(inprogress, comm; dest = status.source, tag = TAG_TASKID)
+    end
+
+    MPI.Barrier(MPI.COMM_WORLD)
+    return accumulator
+end
+
 function worker(funcs, comm)
-    results = Dict{Int,Any}()
+    MPI.send((0, Idle()), comm; dest = 0, tag = TAG_DONE)
+
     while true
         waittime = @elapsed begin
-            taskid, _ = recv(Int, comm; source = 0, tag = TAG_TASKID)
+            taskid = MPI.recv(comm; source = 0, tag = TAG_TASKID)
         end
         if waittime > 1
             @warn "waited a long time for a new task: $waittime s"
@@ -78,11 +95,12 @@ function worker(funcs, comm)
             break
         end
 
-        results[taskid] = funcs[taskid]()
-        send(taskid, comm; dest = 0, tag = TAG_DONE)
+        result = funcs[taskid]()
+        MPI.send((taskid, result), comm; dest = 0, tag = TAG_DONE)
     end
 
-    return results
+    MPI.Barrier(MPI.COMM_WORLD)
+    return nothing
 end
 
 end # module MPIScheduler
