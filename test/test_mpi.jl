@@ -12,9 +12,9 @@ MPI.Init()
 if MPI.Comm_rank(MPI.COMM_WORLD) == 0
     @testset "nranks = $(MPI.Comm_size(MPI.COMM_WORLD))" begin
         @testset for L in Ls
-            if !isnothing(output_file) && L != first(Ls)
+            if !isnothing(output_file) && L > Ls[1]
                 jldopen(output_file, "a+") do f
-                    for i in unique(rand(eachindex(f), 4))
+                    for i in unique(rand(keys(f), 4))
                         delete!(f, i)
                     end
                 end

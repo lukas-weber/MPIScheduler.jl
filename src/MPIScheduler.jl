@@ -17,10 +17,11 @@ function run(
     output_file::Union{Nothing,AbstractString} = nothing,
     comm = MPI.COMM_WORLD,
     log_frequency::Union{Silent,Integer} = max(1, length(funcs) ÷ 1000),
+    accumulator_buffer_size = max(1, length(funcs) ÷ 50),
 )
     accumulator =
         isnothing(output_file) ? MemoryAccumulator(length(funcs)) :
-        JLD2Accumulator(length(funcs), output_file)
+        JLD2Accumulator(length(funcs), output_file, accumulator_buffer_size)
     MPI.Init()
     if MPI.Comm_size(comm) == 1
         for (i, f) in enumerate(funcs)
@@ -77,6 +78,7 @@ function controller(funcs, comm, accumulator; log_frequency)
         MPI.send(inprogress, comm; dest = status.source, tag = TAG_TASKID)
     end
 
+    flush!(accumulator)
     MPI.Barrier(MPI.COMM_WORLD)
     return accumulator
 end
