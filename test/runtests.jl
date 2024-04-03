@@ -1,6 +1,10 @@
 using Test
 using MPI
 using JLD2
+using MPIScheduler
+using Random
+
+include("test_accumulator.jl")
 
 nprocs = 3
 run(

@@ -35,7 +35,7 @@ function run(
 
     MPI.Barrier(MPI.COMM_WORLD)
     if MPI.Comm_rank(comm) == 0
-        return controller(funcs, comm, accumulator; log_frequency)
+        return controller(accumulator, comm; log_frequency)
     else
         return worker(funcs, comm)
     end
@@ -59,22 +59,26 @@ function log_progress(done, num_tasks, log_frequency)
     return nothing
 end
 
-function controller(funcs, comm, accumulator; log_frequency)
+function controller(accumulator, comm; log_frequency)
     inprogress = 0
     done = 0
 
-    while done < length(funcs)
+    active_workers = MPI.Comm_size(comm) - 1
+
+    while active_workers > 0
         (taskid, result), status =
             MPI.recv(comm, MPI.Status; source = MPI.ANY_SOURCE, tag = TAG_DONE)
 
         if result !== Idle()
             accumulator[taskid] = result
             done += 1
-            log_progress(done, length(funcs), log_frequency)
+            log_progress(done, length(accumulator), log_frequency)
         end
 
         inprogress, done = find_next_task(accumulator, inprogress, done)
-
+        if inprogress > length(accumulator) # everything done
+            active_workers -= 1
+        end
         MPI.send(inprogress, comm; dest = status.source, tag = TAG_TASKID)
     end
 
