@@ -12,10 +12,32 @@ function collect_entries(prefix::Tuple, node::Tuple)
 
     stage = maximum(entry -> entry.stage, Iterators.flatten(arg_entries), init = 0) + 1
 
-    return vcat([(; prefix, stage, func = f, num_args = length(args))], arg_entries...)
+    arg_prefixes = ntuple(i -> collect_arg_addresses((i,), args[i]), length(args))
+
+    return vcat([(; prefix, stage, func = f, args = arg_prefixes)], arg_entries...)
 end
 
 collect_entries(prefix::Tuple, node::Function) = collect_entries(prefix, (node,))
+
+function collect_arg_addresses(prefix::Tuple, node::AbstractVector)
+    return [collect_arg_addresses((prefix..., i), a) for (i, a) in enumerate(node)]
+end
+
+collect_arg_addresses(prefix::Tuple, node::Union{Function,Tuple}) = prefix
+
+construct_arg(results::AbstractDict, prefix::Tuple, arg_addresses::AbstractVector) =
+    [construct_arg(results, prefix, arg) for arg in arg_addresses]
+construct_arg(results::AbstractDict, prefix::Tuple, arg_address::Tuple) =
+    results[(prefix..., arg_address...)]
+
+function delete_arg!(results::AbstractDict, prefix::Tuple, arg_addresses::AbstractVector)
+    for arg in arg_addresses
+        delete_arg!(results, prefix, arg)
+    end
+end
+
+delete_arg!(results::AbstractDict, prefix::Tuple, arg_address::Tuple) =
+    delete!(results, (prefix..., arg_address...))
 
 """
     run_tree(tree::Tuple)
@@ -39,15 +61,15 @@ function run_tree(tree; kwargs...)
 
         stage_results = MPIScheduler.run(
             [
-                () -> e.func((results[(e.prefix..., i)] for i = 1:e.num_args)...) for
+                () -> e.func(construct_arg.(Ref(results), Ref(e.prefix), e.args)...) for
                 e in stage_entries
             ];
             kwargs...,
         )
 
         for (entry, result) in zip(stage_entries, stage_results)
-            for n = 1:entry.num_args
-                delete!(results, (entry.prefix..., n))
+            for arg in entry.args
+                delete_arg!(results, entry.prefix, arg)
             end
             results[entry.prefix] = result
         end
@@ -56,5 +78,5 @@ function run_tree(tree; kwargs...)
     if length(results) == 1
         return results[()]
     end
-    return [results[(i,)] for i = 1:length(results)]
+    return construct_arg(results, (), collect_arg_addresses((), tree))
 end

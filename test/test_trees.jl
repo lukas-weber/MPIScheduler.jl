@@ -16,4 +16,9 @@ end
     @test get_prefix_stages(tree2) ==
           Set([((), 3), ((1,), 1), ((2,), 1), ((3,), 2), ((3, 1), 1), ((3, 2), 1)])
     @test MPIScheduler.run_tree(tree2) == 3
+
+    tree3 = (identity, (first ∘ first, [[(identity, Returns(3))]]))
+    @test get_prefix_stages(tree3) ==
+          Set([((), 4), ((1,), 3), ((1, 1, 1, 1), 2), ((1, 1, 1, 1, 1), 1)])
+    @test MPIScheduler.run_tree(tree3) == 3
 end
