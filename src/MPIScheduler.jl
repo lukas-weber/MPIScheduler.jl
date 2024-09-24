@@ -5,6 +5,7 @@ using Dates
 using JLD2
 
 include("result_accumulator.jl")
+include("call_trees.jl")
 
 const TAG_TASKID = 1345
 const TAG_DONE = 1346

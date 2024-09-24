@@ -5,6 +5,7 @@ using MPIScheduler
 using Random
 
 include("test_accumulator.jl")
+include("test_trees.jl")
 
 nprocs = 3
 run(
