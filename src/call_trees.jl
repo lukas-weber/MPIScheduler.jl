@@ -47,7 +47,7 @@ Runs a call tree, in which each node is either
     - a vector of nodes
     - a tuple of the form `(f, args...)` where `f` is a function and each element of `args` is a node.
 """
-function run_tree(tree; kwargs...)
+function run_tree(tree; comm::MPI.Comm = MPI.COMM_WORLD, kwargs...)
     entries = collect_entries((), tree)
 
     sort!(entries, by = e -> e.stage)
@@ -64,8 +64,11 @@ function run_tree(tree; kwargs...)
                 () -> e.func(construct_arg.(Ref(results), Ref(e.prefix), e.args)...) for
                 e in stage_entries
             ];
+            comm,
             kwargs...,
         )
+
+        stage_results = MPI.bcast(stage_results, comm)
 
         for (entry, result) in zip(stage_entries, stage_results)
             for arg in entry.args
