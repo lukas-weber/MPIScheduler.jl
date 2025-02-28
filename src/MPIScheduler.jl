@@ -2,10 +2,8 @@ module MPIScheduler
 using MPI
 using Printf
 using Dates
-using JLD2
 
-include("result_accumulator.jl")
-include("call_trees.jl")
+export provide_pmap, Silent
 
 const TAG_TASKID = 1345
 const TAG_DONE = 1346
@@ -13,38 +11,70 @@ const TAG_DONE = 1346
 struct Silent end
 struct Idle end
 
+struct NoResult end
+
+function provide_pmap(func; comm = MPI.COMM_WORLD, kwargs...)
+    MPI.Init()
+
+    if MPI.Comm_size(comm) == 1
+        return func(map)
+    end
+
+    function pmap(f, args)
+        MPI.Bcast(true, 0, comm)
+
+        funcs = [() -> @invokelatest(f(a)) for a in args]
+
+        funcs = MPI.bcast(funcs, comm)
+        return run(funcs; comm, kwargs...)
+    end
+
+    if MPI.Comm_rank(comm) == 0
+        rv = func(pmap)
+
+        MPI.Bcast(false, 0, comm)
+        return rv
+    end
+
+    # workers listen for pmap calls
+    while true
+        another_one = MPI.Bcast(true, 0, comm)
+        if !another_one
+            break
+        end
+        funcs = MPI.bcast(nothing, comm)
+        run(funcs; comm, kwargs...)
+    end
+end
+
 function run(
     funcs::AbstractVector;
-    output_file::Union{Nothing,AbstractString} = nothing,
     comm = MPI.COMM_WORLD,
     log_frequency::Union{Silent,Integer} = max(1, length(funcs) ÷ 1000),
-    accumulator_buffer_size = max(1, length(funcs) ÷ 50),
 )
-    accumulator =
-        isnothing(output_file) ? MemoryAccumulator(length(funcs)) :
-        JLD2Accumulator(length(funcs), output_file, accumulator_buffer_size)
     MPI.Init()
     if MPI.Comm_size(comm) == 1
+        results = Any[NoResult() for _ in eachindex(funcs)]
         for (i, f) in enumerate(funcs)
-            if !hasresult(accumulator, i)
-                accumulator[i] = f()
-            end
+            results[i] = f()
             log_progress(i, length(funcs), log_frequency)
         end
-        return accumulator
+        return results
     end
 
     MPI.Barrier(MPI.COMM_WORLD)
     if MPI.Comm_rank(comm) == 0
-        return controller(accumulator, comm; log_frequency)
+        return controller(length(funcs), comm; log_frequency)
     else
         return worker(funcs, comm)
     end
 end
 
-function find_next_task(accumulator, inprogress, done)
+hasresult(results::AbstractVector, idx) = results[idx] !== NoResult()
+
+function find_next_task(results, inprogress, done)
     inprogress += 1
-    while inprogress <= length(accumulator) && hasresult(accumulator, inprogress)
+    while inprogress <= length(results) && hasresult(results, inprogress)
         inprogress += 1
         done += 1
     end
@@ -60,7 +90,8 @@ function log_progress(done, num_tasks, log_frequency)
     return nothing
 end
 
-function controller(accumulator, comm; log_frequency)
+function controller(num_tasks, comm; log_frequency)
+    results = Any[NoResult() for _ = 1:num_tasks]
     inprogress = 0
     done = 0
 
@@ -71,21 +102,20 @@ function controller(accumulator, comm; log_frequency)
             MPI.recv(comm, MPI.Status; source = MPI.ANY_SOURCE, tag = TAG_DONE)
 
         if result !== Idle()
-            accumulator[taskid] = result
+            results[taskid] = result
             done += 1
-            log_progress(done, length(accumulator), log_frequency)
+            log_progress(done, num_tasks, log_frequency)
         end
 
-        inprogress, done = find_next_task(accumulator, inprogress, done)
-        if inprogress > length(accumulator) # everything done
+        inprogress, done = find_next_task(results, inprogress, done)
+        if inprogress > num_tasks # everything done
             active_workers -= 1
         end
         MPI.send(inprogress, comm; dest = status.source, tag = TAG_TASKID)
     end
 
-    flush!(accumulator)
     MPI.Barrier(MPI.COMM_WORLD)
-    return accumulator
+    return results
 end
 
 function worker(funcs, comm)
