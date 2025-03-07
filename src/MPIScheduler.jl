@@ -23,9 +23,8 @@ function provide_pmap(func; comm = MPI.COMM_WORLD, kwargs...)
     function pmap(f, args)
         MPI.Bcast(true, 0, comm)
 
+        MPI.bcast((f, args), comm)
         funcs = [() -> @invokelatest(f(a)) for a in args]
-
-        funcs = MPI.bcast(funcs, comm)
         return run(funcs; comm, kwargs...)
     end
 
@@ -42,7 +41,8 @@ function provide_pmap(func; comm = MPI.COMM_WORLD, kwargs...)
         if !another_one
             break
         end
-        funcs = MPI.bcast(nothing, comm)
+        (f, args) = MPI.bcast(nothing, comm)
+        funcs = [() -> @invokelatest(f(a)) for a in args]
         run(funcs; comm, kwargs...)
     end
 end
