@@ -64,6 +64,7 @@ function provide_pmap(func; comm = MPI.COMM_WORLD, kwargs...)
         end
         run(nothing; comm, kwargs...)
     end
+    return nothing
 end
 
 function run(
