@@ -182,6 +182,8 @@ function log_progress(done, num_tasks, log_frequency)
 end
 
 function wait_for_worker!(workers; tries = 3, min_sleep = 0.001, max_sleep = 0.02)
+    i = MPI.Waitany([w.request for w in workers])
+    return popat!(workers,i)
     sleeptime = min_sleep
 
     while true
