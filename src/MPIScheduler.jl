@@ -81,10 +81,13 @@ function handle!(w::WorkerContext, comm, next_task::Tuple{Int,Any})
             old_taskid, w.current_taskid = w.current_taskid, next_taskid
             if isnothing(next_data)
                 w.will_finish = true
+                next_data = MPI.serialize(next_data)
             end
             w.state = WSSendingWork
-            result = MPI.deserialize(w.buffer)
-            s = MPI.serialize(next_data)
+
+            tmp = w.buffer[1:w.total_bytes[]]
+            result = Threads.@spawn MPI.deserialize(tmp)
+            s = fetch(next_data)
             if length(s) > length(w.buffer)
                 w.buffer = s
             else
@@ -207,16 +210,22 @@ function controller(funcs, comm; log_frequency)
     inprogress = 1
     done = 0
 
+    serialized_funcs = [Threads.@spawn MPI.serialize(func) for func in funcs]
+
     workers = WorkerContext.(1:MPI.Comm_size(comm)-1, Ref(comm))
 
     while !isempty(workers)
         next_worker = wait_for_worker!(workers)
 
-        r = handle!(next_worker, comm, (inprogress, get(funcs, inprogress, nothing)))
+        r = handle!(
+            next_worker,
+            comm,
+            (inprogress, get(serialized_funcs, inprogress, nothing)),
+        )
         if r !== nothing
             (taskid, result) = r
 
-            if result !== Idle()
+            if taskid != 0
                 results[taskid] = result
                 done += 1
                 log_progress(done, num_tasks, log_frequency)
@@ -229,7 +238,7 @@ function controller(funcs, comm; log_frequency)
             push!(workers, next_worker)
         end
     end
-
+    results .= fetch.(results)
     MPI.Barrier(MPI.COMM_WORLD)
     return results
 end
