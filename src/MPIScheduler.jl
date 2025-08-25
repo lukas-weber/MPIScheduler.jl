@@ -2,6 +2,7 @@ module MPIScheduler
 using MPI
 using Printf
 using Dates
+using Serialization
 
 
 export provide_pmap, Silent
@@ -31,7 +32,7 @@ mutable struct WorkerContext
     rank::Int
     state::WorkerState
     request::MPI.Request
-    buffer::Vector{UInt8}
+    buffer::IOBuffer
     total_bytes::Ref{Int64}
     transferred_bytes::Int64
     will_finish::Bool
@@ -42,7 +43,7 @@ end
 function WorkerContext(rank, comm)
     total_bytes = Ref{Int64}(0)
     req = MPI.Irecv!(total_bytes, comm; source = rank, tag = TAG_DONE)
-    return WorkerContext(rank, WSWaitingForResult, req, UInt8[], total_bytes, 0, false, 0)
+    return WorkerContext(rank, WSWaitingForResult, req, IOBuffer(), total_bytes, 0, false, 0)
 end
 
 isdone(w::WorkerContext) = w.state == WSDone
@@ -51,7 +52,7 @@ function handle!(w::WorkerContext, comm, next_task::Tuple{Int,Any})
     function irecv_next!(received, total, tag)
         i1 = received + 1
         i2 = min(i1 - 1 + CHUNK_SIZE, total)
-        return MPI.Irecv!(view(w.buffer, i1:i2), comm; source = w.rank, tag)
+        return MPI.Irecv!(view(w.buffer.data, i1:i2), comm; source = w.rank, tag)
     end
 
     # println("$(w.rank): $(w.state), $next_task")
@@ -67,7 +68,8 @@ function handle!(w::WorkerContext, comm, next_task::Tuple{Int,Any})
         end
     elseif w.state == WSWaitingForResult
         w.state = WSReceivingResult
-        resize!(w.buffer, w.total_bytes[])
+        truncate(w.buffer, w.total_bytes[])
+        seekstart(w.buffer)
         w.transferred_bytes = 0
         w.request = irecv_next!(0, w.total_bytes[], TAG_DONE)
         return nothing
@@ -83,14 +85,10 @@ function handle!(w::WorkerContext, comm, next_task::Tuple{Int,Any})
                 w.will_finish = true
             end
             w.state = WSSendingWork
-            result = MPI.deserialize(w.buffer)
-            s = MPI.serialize(next_data)
-            if length(s) > length(w.buffer)
-                w.buffer = s
-            else
-                view(w.buffer, eachindex(s)) .= s
-            end
-            w.total_bytes[] = length(s)
+            result = deserialize(w.buffer)
+            seekstart(w.buffer)
+            serialize(w.buffer, next_data)
+            w.total_bytes[] = position(w.buffer)
             w.transferred_bytes = 0
             w.request = MPI.Isend(w.total_bytes, comm; dest = w.rank, tag = TAG_TASKID)
 
@@ -99,7 +97,7 @@ function handle!(w::WorkerContext, comm, next_task::Tuple{Int,Any})
     elseif w.state == WSSendingWork
         w.request = MPI.Isend(
             view(
-                w.buffer,
+                w.buffer.data,
                 1+w.transferred_bytes:min(
                     w.transferred_bytes + CHUNK_SIZE,
                     w.total_bytes[],
@@ -181,28 +179,6 @@ function log_progress(done, num_tasks, log_frequency)
     return nothing
 end
 
-function wait_for_worker!(workers; tries = 3, min_sleep = 0.001, max_sleep = 0.02)
-    i = MPI.Waitany([w.request for w in workers])
-    return popat!(workers,i)
-    sleeptime = min_sleep
-
-    while true
-        for _ = 1:tries
-            for (i, w) in enumerate(workers)
-                flag = MPI.Test(w.request)
-                if flag
-                    return popat!(workers, i)
-                end
-            end
-        end
-        tries = 1
-        sleep(sleeptime)
-        if sleeptime < max_sleep
-            sleeptime = min(max_sleep, sleeptime * 1.5)
-        end
-    end
-end
-
 function controller(funcs, comm; log_frequency)
     num_tasks = length(funcs)
     results = Any[NoResult() for _ = 1:num_tasks]
@@ -212,7 +188,8 @@ function controller(funcs, comm; log_frequency)
     workers = WorkerContext.(1:MPI.Comm_size(comm)-1, Ref(comm))
 
     while !isempty(workers)
-        next_worker = wait_for_worker!(workers)
+        i = MPI.Waitany([w.request for w in workers])
+        next_worker = workers[i]
 
         r = handle!(next_worker, comm, (inprogress, get(funcs, inprogress, nothing)))
         if r !== nothing
@@ -227,8 +204,8 @@ function controller(funcs, comm; log_frequency)
             inprogress, done = find_next_task(results, inprogress, done)
         end
 
-        if !isdone(next_worker)
-            push!(workers, next_worker)
+        if isdone(next_worker)
+            popat!(workers, i)
         end
     end
 
