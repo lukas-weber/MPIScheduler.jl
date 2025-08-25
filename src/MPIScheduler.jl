@@ -191,7 +191,9 @@ function controller(funcs, comm; log_frequency)
         i = MPI.Waitany([w.request for w in workers])
         next_worker = workers[i]
 
+        GC.enable(false)
         r = handle!(next_worker, comm, (inprogress, get(funcs, inprogress, nothing)))
+        GC.enable(true)
         if r !== nothing
             (taskid, result) = r
 
