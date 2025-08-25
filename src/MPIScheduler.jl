@@ -36,30 +36,18 @@ mutable struct WorkerContext
     transferred_bytes::Int64
     will_finish::Bool
 
-    last_interaction_time::UInt64
+    current_taskid::Int
 end
 
 function WorkerContext(rank, comm)
     total_bytes = Ref{Int64}(0)
     req = MPI.Irecv!(total_bytes, comm; source = rank, tag = TAG_DONE)
-    return WorkerContext(
-        rank,
-        WSWaitingForResult,
-        req,
-        UInt8[],
-        total_bytes,
-        0,
-        false,
-        time_ns(),
-    )
+    return WorkerContext(rank, WSWaitingForResult, req, UInt8[], total_bytes, 0, false, 0)
 end
 
 isdone(w::WorkerContext) = w.state == WSDone
 
-Base.isless(w1::WorkerContext, w2::WorkerContext) =
-    (w1.last_interaction_time, w1.rank) < (w2.last_interaction_time, w2.rank)
-
-function handle!(w::WorkerContext, comm, next_task)
+function handle!(w::WorkerContext, comm, next_task::Tuple{Int,Any})
     function irecv_next!(received, total, tag)
         i1 = received + 1
         i2 = min(i1 - 1 + CHUNK_SIZE, total)
@@ -67,8 +55,6 @@ function handle!(w::WorkerContext, comm, next_task)
     end
 
     # println("$(w.rank): $(w.state), $next_task")
-
-    w.last_interaction_time = time_ns()
 
     if w.state == WSSentWork
         if w.will_finish
@@ -91,12 +77,14 @@ function handle!(w::WorkerContext, comm, next_task)
             w.request = irecv_next!(w.transferred_bytes, w.total_bytes[], TAG_DONE)
             return nothing
         else
-            if next_task[2] === nothing
+            next_taskid, next_data = next_task
+            old_taskid, w.current_taskid = w.current_taskid, next_taskid
+            if isnothing(next_data)
                 w.will_finish = true
             end
             w.state = WSSendingWork
             result = MPI.deserialize(w.buffer)
-            s = MPI.serialize(next_task)
+            s = MPI.serialize(next_data)
             if length(s) > length(w.buffer)
                 w.buffer = s
             else
@@ -106,7 +94,7 @@ function handle!(w::WorkerContext, comm, next_task)
             w.transferred_bytes = 0
             w.request = MPI.Isend(w.total_bytes, comm; dest = w.rank, tag = TAG_TASKID)
 
-            return result
+            return old_taskid, result
         end
     elseif w.state == WSSendingWork
         w.request = MPI.Isend(
@@ -219,8 +207,6 @@ function controller(funcs, comm; log_frequency)
     inprogress = 1
     done = 0
 
-    MPI.Bcast(Int(num_tasks), 0, comm)
-
     workers = WorkerContext.(1:MPI.Comm_size(comm)-1, Ref(comm))
 
     while !isempty(workers)
@@ -249,22 +235,21 @@ function controller(funcs, comm; log_frequency)
 end
 
 function worker(comm)
-    num_tasks = MPI.Bcast(0, 0, comm)
-    send_chunked((0, Idle()), comm; dest = 0, tag = TAG_DONE)
+    send_chunked(Idle(), comm; dest = 0, tag = TAG_DONE)
 
     while true
         waittime = @elapsed begin
-            (taskid, func), _ = recv_chunked(comm; source = 0, tag = TAG_TASKID)
+            func, _ = recv_chunked(comm; source = 0, tag = TAG_TASKID)
         end
         if waittime > 1
             @warn "$(MPI.Comm_rank(comm)) waited a long time for a new task: $waittime s"
         end
-        if taskid < 1 || taskid > num_tasks
+        if isnothing(func)
             break
         end
 
         result = @invokelatest func()
-        send_chunked((taskid, result), comm; dest = 0, tag = TAG_DONE)
+        send_chunked(result, comm; dest = 0, tag = TAG_DONE)
     end
 
     MPI.Barrier(MPI.COMM_WORLD)
