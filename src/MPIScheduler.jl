@@ -142,7 +142,7 @@ function run(
                                            max(1, length(funcs) ÷ 1000),
 )
     MPI.Init()
-    if MPI.Comm_size(comm) == 1 || length(funcs) == 1
+    if MPI.Comm_size(comm) == 1
         results = Any[NoResult() for _ in eachindex(funcs)]
         for (i, f) in enumerate(funcs)
             results[i] = f()
@@ -153,6 +153,10 @@ function run(
 
     MPI.Barrier(MPI.COMM_WORLD)
     if MPI.Comm_rank(comm) == 0
+        if length(funcs) == 1
+            controller([], comm; log_frequency=Silent())
+            return [funcs[1]()]
+        end
         return controller(funcs, comm; log_frequency)
     else
         return worker(comm)
