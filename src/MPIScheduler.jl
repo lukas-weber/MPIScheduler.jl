@@ -142,7 +142,7 @@ function run(
                                            max(1, length(funcs) ÷ 1000),
 )
     MPI.Init()
-    if MPI.Comm_size(comm) == 1
+    if MPI.Comm_size(comm) == 1 || length(funcs) == 1
         results = Any[NoResult() for _ in eachindex(funcs)]
         for (i, f) in enumerate(funcs)
             results[i] = f()
