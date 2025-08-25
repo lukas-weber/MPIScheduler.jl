@@ -2,8 +2,12 @@ module MPIScheduler
 using MPI
 using Printf
 using Dates
+using Serialization
+
 
 export provide_pmap, Silent
+
+include("pmap.jl")
 
 const TAG_TASKID = 1345
 const TAG_DONE = 1346
@@ -14,6 +18,102 @@ struct Idle end
 struct NoResult end
 
 const CHUNK_SIZE = 1 << 31 - 1
+
+@enum WorkerState begin
+    WSSentWork
+    WSSendingWork
+    WSReceivingResult
+    WSWaitingForResult
+    WSDone
+end
+
+# from the perspective of the controller
+mutable struct WorkerContext
+    rank::Int
+    state::WorkerState
+    request::MPI.Request
+    buffer::IOBuffer
+    total_bytes::Ref{Int64}
+    transferred_bytes::Int64
+    will_finish::Bool
+
+    current_taskid::Int
+end
+
+function WorkerContext(rank, comm)
+    total_bytes = Ref{Int64}(0)
+    req = MPI.Irecv!(total_bytes, comm; source = rank, tag = TAG_DONE)
+    return WorkerContext(rank, WSWaitingForResult, req, IOBuffer(), total_bytes, 0, false, 0)
+end
+
+isdone(w::WorkerContext) = w.state == WSDone
+
+function handle!(w::WorkerContext, comm, next_task::Tuple{Int,Any})
+    function irecv_next!(received, total, tag)
+        i1 = received + 1
+        i2 = min(i1 - 1 + CHUNK_SIZE, total)
+        return MPI.Irecv!(view(w.buffer.data, i1:i2), comm; source = w.rank, tag)
+    end
+
+    # println("$(w.rank): $(w.state), $next_task")
+
+    if w.state == WSSentWork
+        if w.will_finish
+            w.state = WSDone
+            return nothing
+        else
+            w.state = WSWaitingForResult
+            w.request = MPI.Irecv!(w.total_bytes, comm; source = w.rank, tag = TAG_DONE)
+            return nothing
+        end
+    elseif w.state == WSWaitingForResult
+        w.state = WSReceivingResult
+        truncate(w.buffer, w.total_bytes[])
+        seekstart(w.buffer)
+        w.transferred_bytes = 0
+        w.request = irecv_next!(0, w.total_bytes[], TAG_DONE)
+        return nothing
+    elseif w.state == WSReceivingResult
+        w.transferred_bytes += CHUNK_SIZE
+        if w.transferred_bytes < w.total_bytes[] > 0
+            w.request = irecv_next!(w.transferred_bytes, w.total_bytes[], TAG_DONE)
+            return nothing
+        else
+            next_taskid, next_data = next_task
+            old_taskid, w.current_taskid = w.current_taskid, next_taskid
+            if isnothing(next_data)
+                w.will_finish = true
+            end
+            w.state = WSSendingWork
+            result = deserialize(w.buffer)
+            seekstart(w.buffer)
+            serialize(w.buffer, next_data)
+            w.total_bytes[] = position(w.buffer)
+            w.transferred_bytes = 0
+            w.request = MPI.Isend(w.total_bytes, comm; dest = w.rank, tag = TAG_TASKID)
+
+            return old_taskid, result
+        end
+    elseif w.state == WSSendingWork
+        w.request = MPI.Isend(
+            view(
+                w.buffer.data,
+                1+w.transferred_bytes:min(
+                    w.transferred_bytes + CHUNK_SIZE,
+                    w.total_bytes[],
+                ),
+            ),
+            comm;
+            dest = w.rank,
+            tag = TAG_TASKID,
+        )
+        w.transferred_bytes += CHUNK_SIZE
+        if w.transferred_bytes >= w.total_bytes[]
+            w.state = WSSentWork
+        end
+        return nothing
+    end
+end
 
 function send_chunked(x, comm; dest, tag)
     chunks = Iterators.partition(MPI.serialize(x), CHUNK_SIZE)
@@ -35,38 +135,6 @@ function recv_chunked(comm; source, tag)
 end
 
 
-function provide_pmap(func; comm = MPI.COMM_WORLD, kwargs...)
-    MPI.Init()
-
-    if MPI.Comm_size(comm) == 1
-        return func(map)
-    end
-
-    function pmap(f, args)
-        MPI.Bcast(true, 0, comm)
-
-        funcs = [() -> @invokelatest(f(a)) for a in args]
-        return run(funcs; comm, kwargs...)
-    end
-
-    if MPI.Comm_rank(comm) == 0
-        rv = func(pmap)
-
-        MPI.Bcast(false, 0, comm)
-        return rv
-    end
-
-    # workers listen for pmap calls
-    while true
-        another_one = MPI.Bcast(true, 0, comm)
-        if !another_one
-            break
-        end
-        run(nothing; comm, kwargs...)
-    end
-    return nothing
-end
-
 function run(
     funcs::Union{AbstractVector,Nothing};
     comm = MPI.COMM_WORLD,
@@ -85,6 +153,10 @@ function run(
 
     MPI.Barrier(MPI.COMM_WORLD)
     if MPI.Comm_rank(comm) == 0
+        if length(funcs) == 1
+            controller([], comm; log_frequency=Silent())
+            return [funcs[1]()]
+        end
         return controller(funcs, comm; log_frequency)
     else
         return worker(comm)
@@ -114,33 +186,33 @@ end
 function controller(funcs, comm; log_frequency)
     num_tasks = length(funcs)
     results = Any[NoResult() for _ = 1:num_tasks]
-    inprogress = 0
+    inprogress = 1
     done = 0
 
-    active_workers = MPI.Comm_size(comm) - 1
+    workers = WorkerContext.(1:MPI.Comm_size(comm)-1, Ref(comm))
 
-    MPI.Bcast(Int(num_tasks), 0, comm)
+    while !isempty(workers)
+        i = MPI.Waitany([w.request for w in workers])
+        next_worker = workers[i]
 
-    while active_workers > 0
-        (taskid, result), status =
-            recv_chunked(comm; source = MPI.ANY_SOURCE, tag = TAG_DONE)
+        GC.enable(false)
+        r = handle!(next_worker, comm, (inprogress, get(funcs, inprogress, nothing)))
+        GC.enable(true)
+        if r !== nothing
+            (taskid, result) = r
 
-        if result !== Idle()
-            results[taskid] = result
-            done += 1
-            log_progress(done, num_tasks, log_frequency)
+            if result !== Idle()
+                results[taskid] = result
+                done += 1
+                log_progress(done, num_tasks, log_frequency)
+            end
+
+            inprogress, done = find_next_task(results, inprogress, done)
         end
 
-        inprogress, done = find_next_task(results, inprogress, done)
-        if inprogress > num_tasks # everything done
-            active_workers -= 1
+        if isdone(next_worker)
+            popat!(workers, i)
         end
-        send_chunked(
-            (inprogress, get(funcs, inprogress, nothing)),
-            comm;
-            dest = status.source,
-            tag = TAG_TASKID,
-        )
     end
 
     MPI.Barrier(MPI.COMM_WORLD)
@@ -148,22 +220,21 @@ function controller(funcs, comm; log_frequency)
 end
 
 function worker(comm)
-    num_tasks = MPI.Bcast(0, 0, comm)
-    send_chunked((0, Idle()), comm; dest = 0, tag = TAG_DONE)
+    send_chunked(Idle(), comm; dest = 0, tag = TAG_DONE)
 
     while true
         waittime = @elapsed begin
-            (taskid, func), _ = recv_chunked(comm; source = 0, tag = TAG_TASKID)
+            func, _ = recv_chunked(comm; source = 0, tag = TAG_TASKID)
         end
         if waittime > 1
-            @warn "waited a long time for a new task: $waittime s"
+            @warn "$(MPI.Comm_rank(comm)) waited a long time for a new task: $waittime s"
         end
-        if taskid < 1 || taskid > num_tasks
+        if isnothing(func)
             break
         end
 
         result = @invokelatest func()
-        send_chunked((taskid, result), comm; dest = 0, tag = TAG_DONE)
+        send_chunked(result, comm; dest = 0, tag = TAG_DONE)
     end
 
     MPI.Barrier(MPI.COMM_WORLD)
