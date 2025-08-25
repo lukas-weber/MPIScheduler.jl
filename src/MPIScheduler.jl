@@ -62,7 +62,7 @@ Base.isless(w1::WorkerContext, w2::WorkerContext) =
 function handle!(w::WorkerContext, comm, next_task)
     function irecv_next!(received, total, tag)
         i1 = received + 1
-        i2 = min(i1 + CHUNK_SIZE, total)
+        i2 = min(i1 - 1 + CHUNK_SIZE, total)
         return MPI.Irecv!(view(w.buffer, i1:i2), comm; source = w.rank, tag)
     end
 
