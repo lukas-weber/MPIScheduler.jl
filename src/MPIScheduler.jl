@@ -113,7 +113,7 @@ function handle!(w::WorkerContext, comm, next_task)
             view(
                 w.buffer,
                 1+w.transferred_bytes:min(
-                    1 + w.transferred_bytes + CHUNK_SIZE,
+                    w.transferred_bytes + CHUNK_SIZE,
                     w.total_bytes[],
                 ),
             ),
