@@ -14,7 +14,6 @@ const TAG_DONE = 1346
 
 struct Silent end
 struct Idle end
-
 struct NoResult end
 
 const CHUNK_SIZE = 1 << 31 - 1
@@ -25,6 +24,14 @@ const CHUNK_SIZE = 1 << 31 - 1
     WSReceivingResult
     WSWaitingForResult
     WSDone
+end
+
+struct WorkerStats
+    recv_time::Float64
+    send_time::Float64
+    serialization_time::Float64
+    total_time::Float64
+    num_tasks::Int
 end
 
 # from the perspective of the controller
@@ -43,7 +50,16 @@ end
 function WorkerContext(rank, comm)
     total_bytes = Ref{Int64}(0)
     req = MPI.Irecv!(total_bytes, comm; source = rank, tag = TAG_DONE)
-    return WorkerContext(rank, WSWaitingForResult, req, IOBuffer(), total_bytes, 0, false, 0)
+    return WorkerContext(
+        rank,
+        WSWaitingForResult,
+        req,
+        IOBuffer(),
+        total_bytes,
+        0,
+        false,
+        0,
+    )
 end
 
 isdone(w::WorkerContext) = w.state == WSDone
@@ -115,13 +131,14 @@ function handle!(w::WorkerContext, comm, next_task::Tuple{Int,Any})
     end
 end
 
-function send_chunked(x, comm; dest, tag)
-    chunks = Iterators.partition(MPI.serialize(x), CHUNK_SIZE)
+function send_chunked(buf, comm; dest, tag)
+    chunks = Iterators.partition(buf, CHUNK_SIZE)
 
     MPI.Send(sum(length, chunks), comm; dest, tag)
     for chunk in chunks
         MPI.Send(chunk, comm; dest, tag)
     end
+    return nothing
 end
 
 function recv_chunked(comm; source, tag)
@@ -131,7 +148,7 @@ function recv_chunked(comm; source, tag)
     for chunk in Iterators.partition(buf, CHUNK_SIZE)
         MPI.Recv!(chunk, comm; status.source, tag)
     end
-    return MPI.deserialize(buf), status
+    return buf, status
 end
 
 
@@ -140,6 +157,7 @@ function run(
     comm = MPI.COMM_WORLD,
     log_frequency::Union{Silent,Integer} = isnothing(funcs) ? Silent() :
                                            max(1, length(funcs) ÷ 1000),
+    log_advanced_stats = true,
 )
     MPI.Init()
     if MPI.Comm_size(comm) == 1
@@ -151,13 +169,13 @@ function run(
         return results
     end
 
-    MPI.Barrier(MPI.COMM_WORLD)
+    MPI.Barrier(comm)
     if MPI.Comm_rank(comm) == 0
         if length(funcs) == 1
-            controller([], comm; log_frequency=Silent())
+            controller([], comm; log_frequency = Silent(), log_advanced_stats = false)
             return [funcs[1]()]
         end
-        return controller(funcs, comm; log_frequency)
+        return controller(funcs, comm; log_frequency, log_advanced_stats)
     else
         return worker(comm)
     end
@@ -177,13 +195,42 @@ end
 
 function log_progress(done, num_tasks, log_frequency)
     if log_frequency !== Silent() && (done % log_frequency == 0 || done == num_tasks)
-        println("$(round(now(), Dates.Second)): $(@sprintf("%5d/%d", done, num_tasks))")
+        @info "$(round(now(), Dates.Second)): $(@sprintf("%5d/%d", done, num_tasks))"
     end
 
     return nothing
 end
 
-function controller(funcs, comm; log_frequency)
+function print_advanced_stats(ctl_wait_time, ctl_handle_time, ctl_total_time, worker_stats)
+    @info @sprintf(
+        "controller: %.2f%% waiting %.2f%% handling of %.2f s total time",
+        100 * ctl_wait_time / ctl_total_time,
+        100 * ctl_handle_time / ctl_total_time,
+        ctl_total_time
+    )
+
+    worker_times =
+        sum(worker_stats) do stats
+            [stats.recv_time, stats.send_time, stats.serialization_time] /
+            stats.total_time
+        end / length(worker_stats)
+
+    total_efficiency =
+        sum(worker_stats) do stats
+            stats.total_time - stats.recv_time - stats.send_time -
+            stats.serialization_time
+        end / (length(worker_stats) * ctl_total_time)
+
+    @info @sprintf(
+        "workers: %.2f%% sending %.2f%% receiving %.2f%% serializing",
+        100 .* worker_times...
+    )
+    @info @sprintf("parallel efficiency: %.2f%%", 100 .* total_efficiency)
+
+    return nothing
+end
+
+function controller(funcs, comm; log_frequency, log_advanced_stats)
     num_tasks = length(funcs)
     results = Any[NoResult() for _ = 1:num_tasks]
     inprogress = 1
@@ -191,13 +238,18 @@ function controller(funcs, comm; log_frequency)
 
     workers = WorkerContext.(1:MPI.Comm_size(comm)-1, Ref(comm))
 
-    while !isempty(workers)
-        i = MPI.Waitany([w.request for w in workers])
+    wait_time = 0.0
+    handle_time = 0.0
+
+    total_time = @elapsed while !isempty(workers)
+        wait_time += @elapsed i = MPI.Waitany([w.request for w in workers])
         next_worker = workers[i]
 
-        GC.enable(false)
-        r = handle!(next_worker, comm, (inprogress, get(funcs, inprogress, nothing)))
-        GC.enable(true)
+        handle_time += @elapsed begin
+            GC.enable(false)
+            r = handle!(next_worker, comm, (inprogress, get(funcs, inprogress, nothing)))
+            GC.enable(true)
+        end
         if r !== nothing
             (taskid, result) = r
 
@@ -215,29 +267,47 @@ function controller(funcs, comm; log_frequency)
         end
     end
 
-    MPI.Barrier(MPI.COMM_WORLD)
+
+    worker_stats = MPI.Gather([WorkerStats(0, 0, 0, 0, 0)], comm)[2:end]
+    if log_advanced_stats
+        print_advanced_stats(wait_time, handle_time, total_time, worker_stats)
+    end
+
     return results
 end
 
 function worker(comm)
-    send_chunked(Idle(), comm; dest = 0, tag = TAG_DONE)
+    send_chunked(MPI.serialize(Idle()), comm; dest = 0, tag = TAG_DONE)
 
-    while true
-        waittime = @elapsed begin
-            func, _ = recv_chunked(comm; source = 0, tag = TAG_TASKID)
+    num_tasks = 0
+
+    recv_time = 0.0
+    send_time = 0.0
+    serialization_time = 0.0
+    total_time = @elapsed while true
+        recv_time += @elapsed begin
+            buf, _ = recv_chunked(comm; source = 0, tag = TAG_TASKID)
         end
-        if waittime > 1
-            @warn "$(MPI.Comm_rank(comm)) waited a long time for a new task: $waittime s"
-        end
+        serialization_time += @elapsed func = MPI.deserialize(buf)
         if isnothing(func)
             break
         end
+        num_tasks += 1
 
         result = @invokelatest func()
-        send_chunked(result, comm; dest = 0, tag = TAG_DONE)
+        serialization_time += @elapsed buf = MPI.serialize(result)
+        send_time += @elapsed send_chunked(buf, comm; dest = 0, tag = TAG_DONE)
     end
+    efficiency = 1 - (send_time + recv_time) / total_time
 
-    MPI.Barrier(MPI.COMM_WORLD)
+    serialization = serialization_time / total_time
+
+
+    MPI.Gather(
+        [WorkerStats(recv_time, send_time, serialization_time, total_time, num_tasks)],
+        comm,
+    )
+
     return nothing
 end
 
